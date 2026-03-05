@@ -26,7 +26,9 @@ import kotlinx.coroutines.launch
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 import java.io.File
+import androidx.compose.runtime.Immutable
 
+@Immutable
 data class VideoWithPlaybackInfo(
   val video: Video,
   val timeRemaining: Long? = null, // in seconds
@@ -91,26 +93,24 @@ class VideoListViewModel(
     viewModelScope.launch(Dispatchers.IO) {
       MediaLibraryEvents.changes.collectLatest {
         // Clear cache when media library changes
-        MediaFileRepository.clearCacheForFolder(bucketId)
+        MediaFileRepository.clearCache()
         loadVideos()
       }
     }
   }
 
   override fun refresh() {
-    // Clear cache for this folder to force fresh data
-    MediaFileRepository.clearCacheForFolder(bucketId)
+    Log.d(tag, "Hard refreshing video list for bucket: $bucketId")
+    // Clear cache to force fresh data from filesystem
+    MediaFileRepository.clearCache()
     loadVideos()
   }
 
   private fun loadVideos() {
     viewModelScope.launch(Dispatchers.IO) {
       try {
-        // Get the hidden files preference
-        val showHiddenFiles = appearancePreferences.showHiddenFiles.get()
-
         // First attempt to load videos (basic info from MediaStore)
-        var videoList = MediaFileRepository.getVideosInFolder(getApplication(), bucketId, showHiddenFiles)
+        var videoList = MediaFileRepository.getVideosInFolder(getApplication(), bucketId)
 
         // Enrich with metadata only if chips are enabled
         if (MetadataRetrieval.isVideoMetadataNeeded(browserPreferences)) {
@@ -141,7 +141,7 @@ class VideoListViewModel(
           Log.d(tag, "No videos found for bucket $bucketId - attempting media rescan")
           triggerMediaScan()
           delay(1000)
-          var retryVideoList = MediaFileRepository.getVideosInFolder(getApplication(), bucketId, showHiddenFiles)
+          var retryVideoList = MediaFileRepository.getVideosInFolder(getApplication(), bucketId)
 
           // Enrich retry list if needed
           if (MetadataRetrieval.isVideoMetadataNeeded(browserPreferences)) {

@@ -8,6 +8,7 @@ import androidx.lifecycle.viewModelScope
 import app.marlboroadvance.mpvex.database.repository.VideoMetadataCacheRepository
 import app.marlboroadvance.mpvex.domain.media.model.VideoFolder
 import app.marlboroadvance.mpvex.domain.playbackstate.repository.PlaybackStateRepository
+import app.marlboroadvance.mpvex.repository.MediaFileRepository
 import app.marlboroadvance.mpvex.preferences.AppearancePreferences
 import app.marlboroadvance.mpvex.preferences.FoldersPreferences
 import app.marlboroadvance.mpvex.ui.browser.base.BaseBrowserViewModel
@@ -20,6 +21,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
@@ -100,7 +102,7 @@ class FolderListViewModel(
     viewModelScope.launch(Dispatchers.IO) {
       MediaLibraryEvents.changes.collectLatest {
         // Clear cache when media library changes
-        app.marlboroadvance.mpvex.repository.MediaFileRepository.clearCache()
+        MediaFileRepository.clearCache()
         loadVideoFolders()
       }
     }
@@ -214,18 +216,17 @@ class FolderListViewModel(
         val thresholdDays = appearancePreferences.unplayedOldVideoDays.get()
         val thresholdMillis = thresholdDays * 24 * 60 * 60 * 1000L
         val currentTime = System.currentTimeMillis()
-        val showHiddenFiles = appearancePreferences.showHiddenFiles.get()
 
         val foldersWithCounts = folders.map { folder ->
           try {
             // Get all videos in this folder
             val videos = app.marlboroadvance.mpvex.repository.MediaFileRepository
-              .getVideosInFolder(getApplication(), folder.bucketId, showHiddenFiles)
+              .getVideosInFolder(getApplication(), folder.bucketId)
 
             // Count new unplayed videos
             val newCount = videos.count { video ->
-              // Check if video was added within threshold days
-              val videoAge = currentTime - (video.dateAdded * 1000)
+              // Check if video was modified within threshold days
+              val videoAge = currentTime - (video.dateModified * 1000)
               val isRecent = videoAge <= thresholdMillis
 
               // Check if video has been played
@@ -252,8 +253,10 @@ class FolderListViewModel(
   }
 
   override fun refresh() {
-    // Clear cache to force fresh data
-    app.marlboroadvance.mpvex.repository.MediaFileRepository.clearCache()
+    Log.d(TAG, "Hard refreshing folder list")
+    // Clear cache to force fresh data from filesystem
+    MediaFileRepository.clearCache()
+    // Force reload of folders
     loadVideoFolders()
   }
 
@@ -289,13 +292,10 @@ class FolderListViewModel(
         // Capture current state for comparison
         val currentFoldersMap = _allVideoFolders.value.associateBy { it.bucketId }
 
-        val showHiddenFiles = appearancePreferences.showHiddenFiles.get()
-
-        // PHASE 1: Fast Parallel Scan
+        // PHASE 1: Fast Parallel Scan (always show all folders)
         val fastFolders = app.marlboroadvance.mpvex.repository.MediaFileRepository
           .getAllVideoFoldersFast(
             context = getApplication(),
-            showHiddenFiles = showHiddenFiles,
             onProgress = { count ->
               // Only show progress if we don't have existing data (silent refresh)
               if (!hasExistingData) {

@@ -21,6 +21,10 @@ import app.marlboroadvance.mpvex.preferences.AudioPreferences
 import app.marlboroadvance.mpvex.preferences.GesturePreferences
 import app.marlboroadvance.mpvex.preferences.PlayerPreferences
 import app.marlboroadvance.mpvex.preferences.SubtitlesPreferences
+import app.marlboroadvance.mpvex.repository.wyzie.WyzieSearchRepository
+import app.marlboroadvance.mpvex.repository.wyzie.WyzieSubtitle
+import app.marlboroadvance.mpvex.utils.media.ChecksumUtils
+import app.marlboroadvance.mpvex.utils.media.MediaInfoParser
 import `is`.xyz.mpv.MPVLib
 import kotlinx.collections.immutable.persistentListOf
 import kotlinx.collections.immutable.toImmutableList
@@ -36,11 +40,14 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
@@ -86,23 +93,61 @@ class PlayerViewModel(
   private val advancedPreferences: AdvancedPreferences by inject()
   private val json: Json by inject()
   private val playbackStateDao: app.marlboroadvance.mpvex.database.dao.PlaybackStateDao by inject()
+  private val wyzieRepository: WyzieSearchRepository by inject()
 
   // Playlist items for the playlist sheet
   private val _playlistItems = kotlinx.coroutines.flow.MutableStateFlow<List<app.marlboroadvance.mpvex.ui.player.controls.components.sheets.PlaylistItem>>(emptyList())
   val playlistItems: kotlinx.coroutines.flow.StateFlow<List<app.marlboroadvance.mpvex.ui.player.controls.components.sheets.PlaylistItem>> = _playlistItems.asStateFlow()
 
-  // Cache for video metadata to avoid re-extracting - limited size to prevent unbounded growth
-  private val metadataCache = LinkedHashMap<String, Pair<String, String>>(101, 1f, true) // key: uri.toString(), value: (duration, resolution)
-  private val METADATA_CACHE_MAX_SIZE = 100
+  // Wyzie Search Results
+  private val _wyzieSearchResults = MutableStateFlow<List<WyzieSubtitle>>(emptyList())
+  val wyzieSearchResults: StateFlow<List<WyzieSubtitle>> = _wyzieSearchResults.asStateFlow()
+
+  private val _isDownloadingSub = MutableStateFlow(false)
+  val isDownloadingSub: StateFlow<Boolean> = _isDownloadingSub.asStateFlow()
+
+  private val _isSearchingSub = MutableStateFlow(false)
+  val isSearchingSub: StateFlow<Boolean> = _isSearchingSub.asStateFlow()
+
+  private val _isOnlineSectionExpanded = MutableStateFlow(true)
+  val isOnlineSectionExpanded: StateFlow<Boolean> = _isOnlineSectionExpanded.asStateFlow()
+
+  // Media Search / Autocomplete
+  private val _mediaSearchResults = MutableStateFlow<List<app.marlboroadvance.mpvex.repository.wyzie.WyzieTmdbResult>>(emptyList())
+  val mediaSearchResults: StateFlow<List<app.marlboroadvance.mpvex.repository.wyzie.WyzieTmdbResult>> = _mediaSearchResults.asStateFlow()
+
+  private val _isSearchingMedia = MutableStateFlow(false)
+  val isSearchingMedia: StateFlow<Boolean> = _isSearchingMedia.asStateFlow()
+
+  // TV Show Details
+  private val _selectedTvShow = MutableStateFlow<app.marlboroadvance.mpvex.repository.wyzie.WyzieTvShowDetails?>(null)
+  val selectedTvShow: StateFlow<app.marlboroadvance.mpvex.repository.wyzie.WyzieTvShowDetails?> = _selectedTvShow.asStateFlow()
+
+  private val _isFetchingTvDetails = MutableStateFlow(false)
+  val isFetchingTvDetails: StateFlow<Boolean> = _isFetchingTvDetails.asStateFlow()
+
+  // Season / Episode
+  private val _selectedSeason = MutableStateFlow<app.marlboroadvance.mpvex.repository.wyzie.WyzieSeason?>(null)
+  val selectedSeason: StateFlow<app.marlboroadvance.mpvex.repository.wyzie.WyzieSeason?> = _selectedSeason.asStateFlow()
+
+  private val _seasonEpisodes = MutableStateFlow<List<app.marlboroadvance.mpvex.repository.wyzie.WyzieEpisode>>(emptyList())
+  val seasonEpisodes: StateFlow<List<app.marlboroadvance.mpvex.repository.wyzie.WyzieEpisode>> = _seasonEpisodes.asStateFlow()
+
+  private val _isFetchingEpisodes = MutableStateFlow(false)
+  val isFetchingEpisodes: StateFlow<Boolean> = _isFetchingEpisodes.asStateFlow()
+
+  private val _selectedEpisode = MutableStateFlow<app.marlboroadvance.mpvex.repository.wyzie.WyzieEpisode?>(null)
+  val selectedEpisode: StateFlow<app.marlboroadvance.mpvex.repository.wyzie.WyzieEpisode?> = _selectedEpisode.asStateFlow()
+
+  fun toggleOnlineSection() {
+      _isOnlineSectionExpanded.value = !_isOnlineSectionExpanded.value
+  }
+
+  // Cache for video metadata to avoid re-extracting — LruCache handles bounds + thread-safety
+  private val metadataCache = object : android.util.LruCache<String, Pair<String, String>>(100) {}
 
   private fun updateMetadataCache(key: String, value: Pair<String, String>) {
-    synchronized(metadataCache) {
-      metadataCache[key] = value
-      // Remove oldest entry if cache exceeds max size
-      if (metadataCache.size > METADATA_CACHE_MAX_SIZE) {
-        metadataCache.remove(metadataCache.keys.firstOrNull())
-      }
-    }
+    metadataCache.put(key, value)
   }
 
   // MPV properties with efficient collection
@@ -125,11 +170,9 @@ class PlayerViewModel(
     // Poll precise position only when playing
     viewModelScope.launch {
       while (isActive) {
-        if (paused != true) {
-          val time = MPVLib.getPropertyDouble("time-pos")
-          if (time != null) {
-            _precisePosition.value = time.toFloat()
-          }
+        val time = MPVLib.getPropertyDouble("time-pos")
+        if (time != null) {
+          _precisePosition.value = time.toFloat()
         }
         delay(16) // ~60fps updates
       }
@@ -222,18 +265,29 @@ class PlayerViewModel(
   private val _videoZoom = MutableStateFlow(0f)
   val videoZoom: StateFlow<Float> = _videoZoom.asStateFlow()
 
+  // Video aspect ratio (not persisted, resets to Fit for each video)
+  private val _videoAspect = MutableStateFlow(VideoAspect.Fit)
+  val videoAspect: StateFlow<VideoAspect> = _videoAspect.asStateFlow()
+
+  // Current aspect ratio value (for custom ratios and tracking)
+  private val _currentAspectRatio = MutableStateFlow(-1.0)
+  val currentAspectRatio: StateFlow<Double> = _currentAspectRatio.asStateFlow()
+
   // Timer
   private var timerJob: Job? = null
   private val _remainingTime = MutableStateFlow(0)
   val remainingTime: StateFlow<Int> = _remainingTime.asStateFlow()
 
   // Media title for subtitle association
-  private var currentMediaTitle: String = ""
+  var currentMediaTitle: String = ""
   private var lastAutoSelectedMediaTitle: String? = null
 
   // External subtitle tracking
   private val _externalSubtitles = mutableListOf<String>()
   val externalSubtitles: List<String> get() = _externalSubtitles.toList()
+  
+  // Mapping from mpv internal path/URI to the original source URI (resolves deletion issues)
+  private val mpvPathToUriMap = mutableMapOf<String, String>()
 
   // Repeat and Shuffle state
   private val _repeatMode = MutableStateFlow(RepeatMode.OFF)
@@ -271,12 +325,16 @@ class PlayerViewModel(
     viewModelScope.launch {
       audioPreferences.volumeBoostCap.changes().collect { cap ->
         val maxVol = 100 + cap
-        MPVLib.setPropertyString("volume-max", maxVol.toString())
-        
-        // Clamp current volume if it exceeds the new limit
-        val currentMpvVol = MPVLib.getPropertyInt("volume") ?: 100
-        if (currentMpvVol > maxVol) {
-          MPVLib.setPropertyInt("volume", maxVol)
+        runCatching {
+          MPVLib.setPropertyString("volume-max", maxVol.toString())
+          
+          // Clamp current volume if it exceeds the new limit
+          val currentMpvVol = MPVLib.getPropertyInt("volume") ?: 100
+          if (currentMpvVol > maxVol) {
+            MPVLib.setPropertyInt("volume", maxVol)
+          }
+        }.onFailure { e ->
+          Log.e(TAG, "Error setting volume-max: $maxVol", e)
         }
       }
     }
@@ -301,6 +359,17 @@ class PlayerViewModel(
       }
     }
     
+    
+    // Refresh custom buttons when Lua scripts are enabled/disabled or configuration changes
+    viewModelScope.launch {
+      combine(
+        advancedPreferences.enableLuaScripts.changes().drop(1),
+        playerPreferences.customButtons.changes().drop(1)
+      ) { _, _ -> }.collect {
+        setupCustomButtons()
+      }
+    }
+
     setupCustomButtons()
   }
 
@@ -314,24 +383,61 @@ class PlayerViewModel(
 
   private val _customButtons = MutableStateFlow<List<CustomButtonState>>(emptyList())
   val customButtons: StateFlow<List<CustomButtonState>> = _customButtons.asStateFlow()
+  private var customButtonsSetupJob: Job? = null
+  private val customButtonsLoadMutex = Mutex()
+  @Volatile
+  private var isMpvReadyForCustomButtons = false
+  @Volatile
+  private var customButtonsScriptPath: String? = null
+  private val customButtonsLoadedFlagProperty = "user-data/mpvex/custombuttons_loaded"
+
+  fun onMpvCoreInitialized() {
+    isMpvReadyForCustomButtons = true
+    reloadCustomButtonsScript("mpv_core_initialized")
+  }
 
   private fun setupCustomButtons() {
-    viewModelScope.launch(Dispatchers.IO) {
+    customButtonsSetupJob?.cancel()
+    customButtonsSetupJob = viewModelScope.launch(Dispatchers.IO) {
       try {
         val buttons = mutableListOf<CustomButtonState>()
+        if (!advancedPreferences.enableLuaScripts.get()) {
+          _customButtons.value = buttons
+          customButtonsScriptPath = null
+          runCatching { MPVLib.setPropertyString(customButtonsLoadedFlagProperty, "0") }
+          return@launch
+        }
+
         val scriptContent = buildString {
           val jsonString = playerPreferences.customButtons.get()
           if (jsonString.isNotBlank()) {
             try {
-               val customButtonsList = json.decodeFromString<List<app.marlboroadvance.mpvex.ui.preferences.CustomButton>>(jsonString)
-               
-               customButtonsList.filter { it.isActive }.forEach { btn ->
-                 val safeId = btn.id.replace("-", "_")
-                 processButton(btn.id, safeId, btn.title, btn.content, btn.longPressContent, btn.onStartup, btn.isLeft, buttons)
+               // Try new slot-based format first
+               val slotsData = json.decodeFromString<app.marlboroadvance.mpvex.ui.preferences.CustomButtonSlots>(jsonString)
+               slotsData.slots.forEachIndexed { index, btn ->
+                 if (btn != null && btn.enabled) {   // skip disabled buttons
+                   val safeId = btn.id.replace("-", "_")
+                   val isLeft = index < 4 // Slots 0-3 are left, 4-7 are right
+                   processButton(btn.id, safeId, btn.title, btn.content, btn.longPressContent, btn.onStartup, isLeft, buttons)
+                 }
                }
             } catch (e: Exception) {
-               e.printStackTrace()
+               // Fallback to old format for backward compatibility
+               try {
+                 val customButtonsList = json.decodeFromString<List<app.marlboroadvance.mpvex.ui.preferences.CustomButton>>(jsonString)
+                 customButtonsList.forEachIndexed { index, btn ->
+                   val safeId = btn.id.replace("-", "_")
+                   val isLeft = index < 4 // First 4 are left buttons, rest are right
+                   processButton(btn.id, safeId, btn.title, btn.content, btn.longPressContent, btn.onStartup, isLeft, buttons)
+                 }
+               } catch (e2: Exception) {
+                 e2.printStackTrace()
+               }
             }
+          }
+
+          if (buttons.isNotEmpty()) {
+            append("mp.set_property_native('$customButtonsLoadedFlagProperty', '1')\n")
           }
         }
 
@@ -343,11 +449,65 @@ class PlayerViewModel(
           
           val file = File(scriptsDir, "custombuttons.lua")
           file.writeText(scriptContent)
-          MPVLib.command("load-script", file.absolutePath)
+          customButtonsScriptPath = file.absolutePath
+
+          if (isMpvReadyForCustomButtons) {
+            val loaded = loadCustomButtonsScript(file)
+            if (!loaded) {
+              android.util.Log.w("PlayerViewModel", "Failed to load custombuttons.lua")
+            }
+          } else {
+            android.util.Log.d("PlayerViewModel", "Deferring custombuttons.lua load until MPV is ready")
+          }
+        } else {
+          customButtonsScriptPath = null
+          runCatching { MPVLib.setPropertyString(customButtonsLoadedFlagProperty, "0") }
         }
       } catch (e: Exception) {
         android.util.Log.e("PlayerViewModel", "Error setting up custom buttons", e)
       }
+    }
+  }
+
+  private fun reloadCustomButtonsScript(reason: String) {
+    if (!isMpvReadyForCustomButtons) return
+
+    viewModelScope.launch(Dispatchers.IO) {
+      customButtonsLoadMutex.withLock {
+        if (!advancedPreferences.enableLuaScripts.get()) return@withLock
+
+        val scriptPath = customButtonsScriptPath
+        if (scriptPath.isNullOrBlank()) return@withLock
+        if (isCustomButtonsScriptLoaded()) return@withLock
+
+        val file = File(scriptPath)
+        if (!file.exists()) {
+          android.util.Log.w("PlayerViewModel", "custombuttons.lua missing during $reason, rebuilding")
+          setupCustomButtons()
+          return@withLock
+        }
+
+        val loaded = loadCustomButtonsScript(file)
+        if (!loaded) {
+          android.util.Log.w("PlayerViewModel", "custombuttons.lua load failed during $reason")
+        }
+      }
+    }
+  }
+
+  private fun isCustomButtonsScriptLoaded(): Boolean =
+    runCatching { MPVLib.getPropertyString(customButtonsLoadedFlagProperty) == "1" }
+      .getOrDefault(false)
+
+  private fun loadCustomButtonsScript(file: File): Boolean {
+    runCatching { MPVLib.setPropertyString(customButtonsLoadedFlagProperty, "0") }
+
+    return runCatching {
+      MPVLib.command("load-script", file.absolutePath)
+      true
+    }.getOrElse {
+      android.util.Log.w("PlayerViewModel", "load-script failed: ${it.message}")
+      false
     }
   }
 
@@ -406,6 +566,7 @@ class PlayerViewModel(
         append("\n")
       }
     }
+
   }
 
   // Cached values
@@ -422,7 +583,24 @@ class PlayerViewModel(
     const val TAG = "PlayerViewModel"
     const val SEEK_COALESCE_DELAY_MS = 60L
     val VALID_SUBTITLE_EXTENSIONS =
-      setOf("srt", "ass", "ssa", "sub", "idx", "vtt", "sup", "txt", "pgs")
+      setOf(
+        // Common & modern
+        "srt", "vtt", "ass", "ssa",
+        // DVD / Blu-ray
+        "sub", "idx", "sup",
+        // Streaming / XML / Professional
+        "xml", "ttml", "dfxp", "itt", "ebu", "imsc", "usf",
+        // Online platforms
+        "sbv", "srv1", "srv2", "srv3", "json",
+        // Legacy & niche
+        "sami", "smi", "mpl", "pjs", "stl", "rt", "psb", "cap",
+        // Broadcast captions
+        "scc", "vttx",
+        // Karaoke / lyrics
+        "lrc", "krc",
+        // Fallback / raw text
+        "txt", "pgs"
+      )
   }
 
   // ==================== Timer ====================
@@ -469,8 +647,14 @@ class PlayerViewModel(
     }
   }
 
-  fun addSubtitle(uri: Uri) {
+  fun addSubtitle(uri: Uri, select: Boolean = true, silent: Boolean = false) {
     viewModelScope.launch(Dispatchers.IO) {
+      val uriString = uri.toString()
+      if (_externalSubtitles.contains(uriString)) {
+        android.util.Log.d("PlayerViewModel", "Subtitle already tracked, skipping: $uriString")
+        return@launch
+      }
+
       runCatching {
         val fileName = getFileNameFromUri(uri) ?: "subtitle.srt"
 
@@ -488,12 +672,18 @@ class PlayerViewModel(
               Intent.FLAG_GRANT_READ_URI_PERMISSION
             )
           } catch (e: SecurityException) {
-            // Permission already granted or not available, continue anyway
-            android.util.Log.w("PlayerViewModel", "Could not take persistent permission for $uri", e)
+            // Permission already granted, not available, or not needed (e.g. from tree).
+            android.util.Log.i("PlayerViewModel", "Persistent permission not taken for $uri (may already have it via tree)")
           }
         }
 
-        MPVLib.command("sub-add", uri.toString(), "select")
+        val mpvPath = uri.resolveUri(host.context) ?: uri.toString()
+        val mode = if (select) "select" else "auto"
+        
+        // Store mapping for reliable physical deletion later
+        mpvPathToUriMap[mpvPath] = uri.toString()
+        
+        MPVLib.command("sub-add", mpvPath, mode)
 
         // Track external subtitle URI for persistence
         val uriString = uri.toString()
@@ -502,13 +692,48 @@ class PlayerViewModel(
         }
 
         val displayName = fileName.take(30).let { if (fileName.length > 30) "$it..." else it }
-        withContext(Dispatchers.Main) {
-          showToast("$displayName added")
+        if (!silent) {
+          withContext(Dispatchers.Main) {
+            showToast("$displayName added")
+          }
         }
       }.onFailure {
-        withContext(Dispatchers.Main) {
-          showToast("Failed to load subtitle")
+        if (!silent) {
+          withContext(Dispatchers.Main) {
+            showToast("Failed to load subtitle")
+          }
         }
+      }
+    }
+  }
+
+  private fun scanLocalSubtitles(mediaTitle: String) {
+    viewModelScope.launch(Dispatchers.IO) {
+      val saveFolderUri = subtitlesPreferences.subtitleSaveFolder.get()
+      if (saveFolderUri.isBlank()) return@launch
+      
+      try {
+        val sanitizedTitle = MediaInfoParser.parse(mediaTitle).title
+        val fullTitle = mediaTitle.substringBeforeLast(".")
+        val checksumTitle = ChecksumUtils.getCRC32(mediaTitle)
+        val parentDir = DocumentFile.fromTreeUri(host.context, Uri.parse(saveFolderUri)) ?: return@launch
+        
+        // Scan potential folder names for compatibility: checksum, full, and sanitized
+        listOf(checksumTitle, fullTitle, sanitizedTitle).distinct().forEach { folderName ->
+          val movieDir = parentDir.findFile(folderName) ?: return@forEach
+          if (movieDir.isDirectory) {
+            movieDir.listFiles().forEach { file ->
+              if (file.isFile && isValidSubtitleFile(file.name ?: "")) {
+                withContext(Dispatchers.Main) {
+                  // Don't auto-select during scan, just make available
+                  addSubtitle(file.uri, select = false, silent = true)
+                }
+              }
+            }
+          }
+        }
+      } catch (e: Exception) {
+        android.util.Log.e("PlayerViewModel", "Error scanning local subtitles: ${e.message}", e)
       }
     }
   }
@@ -519,42 +744,156 @@ class PlayerViewModel(
       lastAutoSelectedMediaTitle = null
       // Clear external subtitles when media changes
       _externalSubtitles.clear()
+      // Scan for previously downloaded/added subtitles
+      scanLocalSubtitles(mediaTitle)
     }
   }
 
-  fun setExternalSubtitles(subtitles: List<String>) {
-    _externalSubtitles.clear()
-    _externalSubtitles.addAll(subtitles)
-  }
 
   fun removeSubtitle(id: Int) {
     viewModelScope.launch(Dispatchers.IO) {
-      // Find the subtitle URI before removing
+      // Find the subtitle track info before removing
       val tracks = subtitleTracks.value
       val trackToRemove = tracks.firstOrNull { it.id == id }
       
-      // Remove from MPV
-      MPVLib.command("sub-remove", id.toString())
-      
-      // Remove from tracked external subtitles if it's external
-      if (trackToRemove?.external == true) {
-        // Try to find and remove from our tracked list
-        // Since we can't get the original URI from MPV, we'll remove based on external flag
-        // This is a limitation, but on reload we'll re-add all tracked subtitles anyway
+      // If it's external, physically delete the file if we can find its URI
+      if (trackToRemove?.external == true && trackToRemove.externalFilename != null) {
+        val mpvPath = trackToRemove.externalFilename
+        val originalUriString = mpvPathToUriMap[mpvPath] ?: mpvPath
+        val uri = Uri.parse(originalUriString)
+        
+        val deleted = wyzieRepository.deleteSubtitleFile(uri)
+        
+        if (deleted) {
+          _externalSubtitles.remove(originalUriString)
+          mpvPathToUriMap.remove(mpvPath)
+          withContext(Dispatchers.Main) {
+            showToast("Subtitle deleted")
+          }
+        }
       }
+      
+        MPVLib.command("sub-remove", id.toString())
     }
   }
 
-  fun selectSub(id: Int) {
-    val primarySid = MPVLib.getPropertyInt("sid")
+  // --- Media Search and Series Management ---
 
-    // Toggle subtitle: if clicking the current subtitle, turn it off, otherwise select the new one
-    if (id == primarySid) {
-      MPVLib.setPropertyBoolean("sid", false)
+  private var mediaSearchJob: Job? = null
+
+  fun searchMedia(query: String) {
+    mediaSearchJob?.cancel()
+    if (query.isBlank()) {
+      _mediaSearchResults.value = emptyList()
+      return
+    }
+
+    mediaSearchJob = viewModelScope.launch {
+      delay(300) // Debounce
+      _isSearchingMedia.value = true
+      wyzieRepository.searchMedia(query)
+        .onSuccess { results ->
+          _mediaSearchResults.value = results
+        }
+        .onFailure {
+          // Silent failure for autocomplete, or optionally show toast(if someone is reading this if u need u can impelmen this in future )
+        }
+      _isSearchingMedia.value = false
+    }
+  }
+
+  fun selectMedia(result: app.marlboroadvance.mpvex.repository.wyzie.WyzieTmdbResult) {
+    _mediaSearchResults.value = emptyList() // Clear results after selection
+    _wyzieSearchResults.value = emptyList() // Clear old subtitle results
+    
+    if (result.mediaType == "tv") {
+      fetchTvShowDetails(result.id)
     } else {
-      MPVLib.setPropertyInt("sid", id)
+      // For movies, just search subtitles directly with the TMDB ID
+      searchSubtitles(result.title)
+      // Ideally we should pass the TMDB ID to searchSubtitles too if the API supports it
     }
   }
+
+  private fun fetchTvShowDetails(id: Int) {
+    viewModelScope.launch {
+      _isFetchingTvDetails.value = true
+      wyzieRepository.getTvShowDetails(id)
+        .onSuccess { details ->
+          val validSeasons = details.seasons.filter { it.season_number > 0 }.sortedBy { it.season_number }
+          _selectedTvShow.value = details.copy(seasons = validSeasons)
+          _selectedSeason.value = null
+          _seasonEpisodes.value = emptyList()
+        }
+        .onFailure {
+          showToast("Failed to load series details: ${it.message}")
+        }
+      _isFetchingTvDetails.value = false
+    }
+  }
+
+  fun selectSeason(season: app.marlboroadvance.mpvex.repository.wyzie.WyzieSeason) {
+    val tvShowId = _selectedTvShow.value?.id ?: return
+    _selectedSeason.value = season
+    
+    viewModelScope.launch {
+      _isFetchingEpisodes.value = true
+      wyzieRepository.getSeasonEpisodes(tvShowId, season.season_number)
+        .onSuccess { episodes ->
+          val validEpisodes = episodes.filter { it.episode_number > 0 }.sortedBy { it.episode_number }
+          _seasonEpisodes.value = validEpisodes
+          _selectedEpisode.value = null
+        }
+        .onFailure {
+          showToast("Failed to load episodes: ${it.message}")
+        }
+      _isFetchingEpisodes.value = false
+    }
+  }
+
+  fun selectEpisode(episode: app.marlboroadvance.mpvex.repository.wyzie.WyzieEpisode) {
+    _selectedEpisode.value = episode
+    val tvShowName = _selectedTvShow.value?.name ?: currentMediaTitle
+    searchSubtitles(tvShowName, episode.season_number, episode.episode_number)
+  }
+
+  fun clearMediaSelection() {
+    _selectedTvShow.value = null
+    _selectedSeason.value = null
+    _seasonEpisodes.value = emptyList()
+    _selectedEpisode.value = null
+    _mediaSearchResults.value = emptyList()
+  }
+
+  // --- Subtitle Search ---
+  fun searchSubtitles(query: String, season: Int? = null, episode: Int? = null) {
+     viewModelScope.launch {
+         _isSearchingSub.value = true
+         wyzieRepository.search(query, season, episode)
+             .onSuccess { results ->
+                 _wyzieSearchResults.value = results
+             }
+             .onFailure {
+                 showToast("Search failed: ${it.message}")
+             }
+         _isSearchingSub.value = false
+     }
+  }
+
+  fun downloadSubtitle(subtitle: WyzieSubtitle) {
+      viewModelScope.launch {
+          _isDownloadingSub.value = true
+          wyzieRepository.download(subtitle, currentMediaTitle)
+              .onSuccess { uri ->
+                  addSubtitle(uri)
+              }
+              .onFailure {
+                  showToast("Download failed: ${it.message}")
+              }
+          _isDownloadingSub.value = false
+      }
+  }
+
 
   fun toggleSubtitle(id: Int) {
     val primarySid = MPVLib.getPropertyInt("sid") ?: 0
@@ -867,23 +1206,40 @@ class PlayerViewModel(
         MPVLib.setPropertyDouble("video-aspect-override", -1.0)
       }
       VideoAspect.Crop -> {
-        // To CROP: Set panscan. MPV will auto-reset video-aspect-override.
+        // To CROP: Reset aspect override first, then set panscan
+        MPVLib.setPropertyDouble("video-aspect-override", -1.0)
         MPVLib.setPropertyDouble("panscan", 1.0)
       }
       VideoAspect.Stretch -> {
-        // To STRETCH: Calculate ratio and set it. MPV will auto-reset panscan.
+        // To STRETCH: Calculate screen ratio accounting for video rotation
         @Suppress("DEPRECATION")
         val dm = DisplayMetrics()
         @Suppress("DEPRECATION")
         host.hostWindowManager.defaultDisplay.getRealMetrics(dm)
-        val ratio = dm.widthPixels / dm.heightPixels.toDouble()
+        
+        // Get video rotation from metadata
+        val rotate = MPVLib.getPropertyInt("video-params/rotate") ?: 0
+        val isVideoRotated = (rotate % 180 == 90) // 90° or 270° rotation
+        
+        // Calculate screen ratio, inverting if video is rotated
+        val screenRatio = if (isVideoRotated) {
+          // Video is rotated, so invert the screen ratio
+          dm.heightPixels.toDouble() / dm.widthPixels.toDouble()
+        } else {
+          // Video is not rotated, use normal screen ratio
+          dm.widthPixels.toDouble() / dm.heightPixels.toDouble()
+        }
 
-        MPVLib.setPropertyDouble("video-aspect-override", ratio)
+        // Set aspect override first, then reset panscan
+        // This prevents the brief flash of Fit mode
+        MPVLib.setPropertyDouble("video-aspect-override", screenRatio)
+        MPVLib.setPropertyDouble("panscan", 0.0)
       }
     }
 
-    // Save the preference
-    playerPreferences.videoAspect.set(aspect)
+    // Update the state
+    _videoAspect.value = aspect
+    _currentAspectRatio.value = -1.0 // Reset custom ratio when using standard modes
 
     // Notify the UI
     if (showUpdate) {
@@ -894,16 +1250,8 @@ class PlayerViewModel(
   fun setCustomAspectRatio(ratio: Double) {
     MPVLib.setPropertyDouble("panscan", 0.0)
     MPVLib.setPropertyDouble("video-aspect-override", ratio)
-    playerPreferences.currentAspectRatio.set(ratio.toFloat())
+    _currentAspectRatio.value = ratio
     playerUpdate.value = PlayerUpdates.AspectRatio
-  }
-
-  fun restoreCustomAspectRatio() {
-    val savedRatio = playerPreferences.currentAspectRatio.get()
-    if (savedRatio > 0) {
-      MPVLib.setPropertyDouble("panscan", 0.0)
-      MPVLib.setPropertyDouble("video-aspect-override", savedRatio.toDouble())
-    }
   }
 
   // ==================== Screen Rotation ====================
@@ -1055,6 +1403,24 @@ class PlayerViewModel(
   fun setVideoZoom(zoom: Float) {
     _videoZoom.value = zoom
     MPVLib.setPropertyDouble("video-zoom", zoom.toDouble())
+  }
+
+  // Video pan (for pan & zoom feature)
+  private val _videoPanX = MutableStateFlow(0f)
+  val videoPanX: StateFlow<Float> = _videoPanX.asStateFlow()
+
+  private val _videoPanY = MutableStateFlow(0f)
+  val videoPanY: StateFlow<Float> = _videoPanY.asStateFlow()
+
+  fun setVideoPan(x: Float, y: Float) {
+    _videoPanX.value = x
+    _videoPanY.value = y
+    MPVLib.setPropertyDouble("video-pan-x", x.toDouble())
+    MPVLib.setPropertyDouble("video-pan-y", y.toDouble())
+  }
+
+  fun resetVideoPan() {
+    setVideoPan(0f, 0f)
   }
 
   fun resetVideoZoom() {
@@ -1349,6 +1715,13 @@ class PlayerViewModel(
       return "" to ""
     }
 
+    // Try MediaStore first (much faster - uses cached values)
+    val mediaStoreMetadata = getVideoMetadataFromMediaStore(uri)
+    if (mediaStoreMetadata != null) {
+      return mediaStoreMetadata
+    }
+
+    // Fallback to MediaMetadataRetriever only if MediaStore fails
     val retriever = android.media.MediaMetadataRetriever()
     return try {
       // For file:// URIs, use the path directly (faster)
@@ -1362,10 +1735,7 @@ class PlayerViewModel(
       // Get duration
       val durationMs = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
       val durationStr = if (durationMs != null) {
-        val seconds = durationMs.toLong() / 1000
-        val minutes = seconds / 60
-        val remainingSeconds = seconds % 60
-        "${minutes}:${remainingSeconds.toString().padStart(2, '0')}"
+        formatDuration(durationMs.toLong())
       } else ""
 
       // Get resolution
@@ -1387,6 +1757,143 @@ class PlayerViewModel(
       }
     }
   }
+
+  /**
+   * Get video metadata from MediaStore (fast - uses cached system values).
+   * Returns null if the video is not found in MediaStore.
+   */
+  private fun getVideoMetadataFromMediaStore(uri: Uri): Pair<String, String>? {
+    return try {
+      val projection = arrayOf(
+        android.provider.MediaStore.Video.Media.DURATION,
+        android.provider.MediaStore.Video.Media.WIDTH,
+        android.provider.MediaStore.Video.Media.HEIGHT,
+        android.provider.MediaStore.Video.Media.DATA
+      )
+
+      // Determine the query URI based on the input URI scheme
+      val queryUri = when (uri.scheme) {
+        "content" -> {
+          // If it's already a content URI, use it directly
+          if (uri.toString().startsWith(android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI.toString())) {
+            uri
+          } else {
+            // Try to find by path if available
+            null
+          }
+        }
+        "file" -> {
+          // For file:// URIs, query by path
+          null
+        }
+        else -> null
+      }
+
+      // Query by URI if we have a content URI
+      if (queryUri != null) {
+        host.context.contentResolver.query(
+          queryUri,
+          projection,
+          null,
+          null,
+          null
+        )?.use { cursor ->
+          if (cursor.moveToFirst()) {
+            val durationColumn = cursor.getColumnIndex(android.provider.MediaStore.Video.Media.DURATION)
+            val widthColumn = cursor.getColumnIndex(android.provider.MediaStore.Video.Media.WIDTH)
+            val heightColumn = cursor.getColumnIndex(android.provider.MediaStore.Video.Media.HEIGHT)
+
+            val durationMs = if (durationColumn >= 0) cursor.getLong(durationColumn) else 0L
+            val width = if (widthColumn >= 0) cursor.getInt(widthColumn) else 0
+            val height = if (heightColumn >= 0) cursor.getInt(heightColumn) else 0
+
+            val durationStr = formatDuration(durationMs)
+
+            val resolutionStr = if (width > 0 && height > 0) {
+              "${width}x${height}"
+            } else ""
+
+            return durationStr to resolutionStr
+          }
+        }
+      }
+
+      // Query by file path if we have a file:// URI or content URI without direct match
+      val filePath = when (uri.scheme) {
+        "file" -> uri.path
+        "content" -> {
+          // Try to get the file path from content URI
+          host.context.contentResolver.query(
+            uri,
+            arrayOf(android.provider.MediaStore.Video.Media.DATA),
+            null,
+            null,
+            null
+          )?.use { cursor ->
+            if (cursor.moveToFirst()) {
+              val dataColumn = cursor.getColumnIndex(android.provider.MediaStore.Video.Media.DATA)
+              if (dataColumn >= 0) cursor.getString(dataColumn) else null
+            } else null
+          }
+        }
+        else -> null
+      }
+
+      if (filePath != null) {
+        val selection = "${android.provider.MediaStore.Video.Media.DATA} = ?"
+        val selectionArgs = arrayOf(filePath)
+
+        host.context.contentResolver.query(
+          android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+          projection,
+          selection,
+          selectionArgs,
+          null
+        )?.use { cursor ->
+          if (cursor.moveToFirst()) {
+            val durationColumn = cursor.getColumnIndex(android.provider.MediaStore.Video.Media.DURATION)
+            val widthColumn = cursor.getColumnIndex(android.provider.MediaStore.Video.Media.WIDTH)
+            val heightColumn = cursor.getColumnIndex(android.provider.MediaStore.Video.Media.HEIGHT)
+
+            val durationMs = if (durationColumn >= 0) cursor.getLong(durationColumn) else 0L
+            val width = if (widthColumn >= 0) cursor.getInt(widthColumn) else 0
+            val height = if (heightColumn >= 0) cursor.getInt(heightColumn) else 0
+
+            val durationStr = formatDuration(durationMs)
+
+            val resolutionStr = if (width > 0 && height > 0) {
+              "${width}x${height}"
+            } else ""
+
+            return durationStr to resolutionStr
+          }
+        }
+      }
+
+      null
+    } catch (e: Exception) {
+      android.util.Log.w("PlayerViewModel", "Failed to get metadata from MediaStore for $uri, will try MediaMetadataRetriever", e)
+      null
+    }
+  }
+
+  /**
+   * Format duration in milliseconds to hh:mm:ss or mm:ss format
+   */
+  private fun formatDuration(durationMs: Long): String {
+    if (durationMs <= 0) return ""
+    
+    val totalSeconds = durationMs / 1000
+    val hours = totalSeconds / 3600
+    val minutes = (totalSeconds % 3600) / 60
+    val seconds = totalSeconds % 60
+    
+    return if (hours > 0) {
+      String.format("%d:%02d:%02d", hours, minutes, seconds)
+    } else {
+      String.format("%d:%02d", minutes, seconds)
+    }
+  }
   
   
 
@@ -1405,7 +1912,7 @@ class PlayerViewModel(
       if (updatedItems != null) {
         // Clear cache if playlist size changed
         if (_playlistItems.value.size != updatedItems.size) {
-          metadataCache.clear()
+          metadataCache.evictAll()
         }
 
         _playlistItems.value = updatedItems
@@ -1440,8 +1947,8 @@ class PlayerViewModel(
         batch.forEach { item ->
           val cacheKey = item.uri.toString()
 
-          // Skip if already in cache (synchronized access)
-          if (!synchronized(metadataCache) { metadataCache.containsKey(cacheKey) }) {
+          // Skip if already in cache (LruCache is thread-safe)
+          if (metadataCache.get(cacheKey) == null) {
             // Extract metadata
             val (durationStr, resolutionStr) = getVideoMetadata(item.uri)
 
@@ -1474,8 +1981,6 @@ class PlayerViewModel(
   fun playPrevious() {
     (host as? PlayerActivity)?.playPrevious()
   }
-
-  fun getCurrentMediaTitle(): String = currentMediaTitle
 
   // ==================== Repeat and Shuffle ====================
 
@@ -1607,7 +2112,6 @@ class PlayerViewModel(
   fun showToast(message: String) {
     Toast.makeText(host.context, message, Toast.LENGTH_SHORT).show()
   }
-
 }
 
 // Extension functions

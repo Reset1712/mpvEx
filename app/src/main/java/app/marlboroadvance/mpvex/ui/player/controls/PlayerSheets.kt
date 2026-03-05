@@ -21,7 +21,9 @@ import app.marlboroadvance.mpvex.ui.player.controls.components.sheets.MoreSheet
 import app.marlboroadvance.mpvex.ui.player.controls.components.sheets.PlaybackSpeedSheet
 import app.marlboroadvance.mpvex.ui.player.controls.components.sheets.PlaylistSheet
 import app.marlboroadvance.mpvex.ui.player.controls.components.sheets.SubtitlesSheet
+import app.marlboroadvance.mpvex.ui.player.controls.components.sheets.OnlineSubtitleSearchSheet
 import app.marlboroadvance.mpvex.ui.player.controls.components.sheets.VideoZoomSheet
+import app.marlboroadvance.mpvex.utils.media.MediaInfoParser
 import dev.vivvvek.seeker.Segment
 import kotlinx.collections.immutable.ImmutableList
 import kotlinx.collections.immutable.toImmutableList
@@ -82,6 +84,12 @@ fun PlayerSheets(
       val subtitlesPreferences = koinInject<app.marlboroadvance.mpvex.preferences.SubtitlesPreferences>()
       val savedPickerPath = subtitlesPreferences.pickerPath.get()
 
+      val currentMediaTitle = viewModel.currentMediaTitle
+      val matchToName = if (currentMediaTitle.isNotBlank()) {
+          // Remove extension if present to improve matching
+          currentMediaTitle.substringBeforeLast(".")
+      } else null
+
       var showFilePicker by remember { mutableStateOf(false) }
 
       if (showFilePicker) {
@@ -111,7 +119,8 @@ fun PlayerSheets(
                       "*/*",
                     ),
                   )
-              }
+              },
+              matchToName = matchToName
           )
       }
 
@@ -119,13 +128,62 @@ fun PlayerSheets(
         tracks = subtitles.toImmutableList(),
         onToggleSubtitle = onToggleSubtitle,
         isSubtitleSelected = isSubtitleSelected,
-        onAddSubtitle = {
-             showFilePicker = true
-        },
+        onAddSubtitle = { showFilePicker = true },
         onRemoveSubtitle = onRemoveSubtitle,
         onOpenSubtitleSettings = { onOpenPanel(Panels.SubtitleSettings) },
         onOpenSubtitleDelay = { onOpenPanel(Panels.SubtitleDelay) },
+        onOpenOnlineSearch = { onShowSheet(Sheets.OnlineSubtitleSearch) },
+        onDismissRequest = onDismissRequest
+      )
+    }
+
+    Sheets.OnlineSubtitleSearch -> {
+      val isSearching by viewModel.isSearchingSub.composeCollectAsState()
+      val isDownloading by viewModel.isDownloadingSub.composeCollectAsState()
+      val results by viewModel.wyzieSearchResults.composeCollectAsState()
+      val isOnlineSectionExpanded by viewModel.isOnlineSectionExpanded.composeCollectAsState()
+
+      // Media Search / Autocomplete
+      val mediaResults by viewModel.mediaSearchResults.composeCollectAsState()
+      val isSearchingMedia by viewModel.isSearchingMedia.composeCollectAsState()
+      
+      // TV Show / Seasons / Episodes
+      val selectedTvShow by viewModel.selectedTvShow.composeCollectAsState()
+      val isFetchingTvDetails by viewModel.isFetchingTvDetails.composeCollectAsState()
+      val selectedSeason by viewModel.selectedSeason.composeCollectAsState()
+      val seasonEpisodes by viewModel.seasonEpisodes.composeCollectAsState()
+      val isFetchingEpisodes by viewModel.isFetchingEpisodes.composeCollectAsState()
+      val selectedEpisode by viewModel.selectedEpisode.composeCollectAsState()
+
+      OnlineSubtitleSearchSheet(
         onDismissRequest = onDismissRequest,
+        onDownloadOnline = { viewModel.downloadSubtitle(it) },
+        isSearching = isSearching,
+        isDownloading = isDownloading,
+        searchResults = results.toImmutableList(),
+        isOnlineSectionExpanded = isOnlineSectionExpanded,
+        onToggleOnlineSection = { viewModel.toggleOnlineSection() },
+        mediaTitle = viewModel.currentMediaTitle,
+        // Autocomplete & Series Selection
+        mediaSearchResults = mediaResults.toImmutableList(),
+        isSearchingMedia = isSearchingMedia,
+        onSearchMedia = { 
+          viewModel.searchMedia(it)
+          val mediaInfo = MediaInfoParser.parse(viewModel.currentMediaTitle)
+          val s = selectedSeason?.season_number
+          val e = selectedEpisode?.episode_number
+          viewModel.searchSubtitles(it, s, e)
+        },
+        onSelectMedia = { viewModel.selectMedia(it) },
+        selectedTvShow = selectedTvShow,
+        isFetchingTvDetails = isFetchingTvDetails,
+        selectedSeason = selectedSeason,
+        onSelectSeason = { viewModel.selectSeason(it) },
+        seasonEpisodes = seasonEpisodes.toImmutableList(),
+        isFetchingEpisodes = isFetchingEpisodes,
+        selectedEpisode = selectedEpisode,
+        onSelectEpisode = { viewModel.selectEpisode(it) },
+        onClearMediaSelection = { viewModel.clearMediaSelection() }
       )
     }
 
@@ -170,7 +228,6 @@ fun PlayerSheets(
         onStartTimer = onStartSleepTimer,
         onDismissRequest = onDismissRequest,
         onEnterFiltersPanel = { onOpenPanel(Panels.VideoFilters) },
-        onEnterLuaScriptsPanel = { onOpenPanel(Panels.LuaScripts) },
       )
     }
 
@@ -193,6 +250,7 @@ fun PlayerSheets(
       VideoZoomSheet(
         videoZoom = videoZoom,
         onSetVideoZoom = viewModel::setVideoZoom,
+        onResetVideoPan = viewModel::resetVideoPan,
         onDismissRequest = onDismissRequest,
       )
     }
@@ -200,7 +258,7 @@ fun PlayerSheets(
     Sheets.AspectRatios -> {
       val playerPreferences = koinInject<app.marlboroadvance.mpvex.preferences.PlayerPreferences>()
       val customRatiosSet by playerPreferences.customAspectRatios.collectAsState()
-      val currentRatio by playerPreferences.currentAspectRatio.collectAsState()
+      val currentRatio by viewModel.currentAspectRatio.composeCollectAsState()
       val customRatios =
         customRatiosSet.mapNotNull { str ->
           val parts = str.split("|")
@@ -216,10 +274,16 @@ fun PlayerSheets(
         }
 
       AspectRatioSheet(
-        currentRatio = currentRatio.toDouble(),
+        currentRatio = currentRatio,
         customRatios = customRatios,
         onSelectRatio = { ratio ->
-          viewModel.setCustomAspectRatio(ratio)
+          if (ratio < 0) {
+            // Default selected - apply Fit mode
+            viewModel.changeVideoAspect(app.marlboroadvance.mpvex.ui.player.VideoAspect.Fit)
+          } else {
+            // Custom ratio selected
+            viewModel.setCustomAspectRatio(ratio)
+          }
         },
         onAddCustomRatio = { label, ratio ->
           playerPreferences.customAspectRatios.set(customRatiosSet + "$label|$ratio")
@@ -228,9 +292,9 @@ fun PlayerSheets(
         onDeleteCustomRatio = { ratio ->
           val toRemove = "${ratio.label}|${ratio.ratio}"
           playerPreferences.customAspectRatios.set(customRatiosSet - toRemove)
-          // If the deleted ratio is currently active, reset to default
+          // If the deleted ratio is currently active, reset to default (Fit)
           if (kotlin.math.abs(currentRatio - ratio.ratio) < 0.01) {
-            viewModel.setCustomAspectRatio(-1.0)
+            viewModel.changeVideoAspect(app.marlboroadvance.mpvex.ui.player.VideoAspect.Fit)
           }
         },
         onDismissRequest = onDismissRequest,
@@ -277,7 +341,7 @@ fun PlayerSheets(
           isM3UPlaylist = isM3U,
           playerPreferences = playerPreferences,
         )
-      }
     }
   }
+}
 }

@@ -62,6 +62,7 @@ import dev.vivvvek.seeker.Segment
 import `is`.xyz.mpv.Utils
 import kotlinx.collections.immutable.ImmutableList
 import kotlinx.collections.immutable.persistentListOf
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
@@ -141,9 +142,12 @@ fun SeekbarWithTimers(
                 if (!isUserInteracting) isUserInteracting = true
                 userPosition = newPosition.coerceIn(0f, duration)
                 onValueChange(userPosition)
-                scope.launch { animatedPosition.snapTo(userPosition) }
-                isUserInteracting = false
-                onValueChangeFinished()
+                scope.launch { 
+                  // Snap to user position immediately to prevent jumping
+                  animatedPosition.snapTo(userPosition)
+                  isUserInteracting = false
+                  onValueChangeFinished()
+                }
               }
             )
           }
@@ -153,14 +157,21 @@ fun SeekbarWithTimers(
                 isUserInteracting = true 
               },
               onDragEnd = { 
-                scope.launch { animatedPosition.snapTo(userPosition) }
-                isUserInteracting = false
-                onValueChangeFinished()
+                scope.launch { 
+                  // Allow a tiny window for mpv/viewModel to sync back before releasing control
+                  delay(50) 
+                  animatedPosition.snapTo(userPosition)
+                  isUserInteracting = false
+                  onValueChangeFinished()
+                }
               },
               onDragCancel = { 
-                scope.launch { animatedPosition.snapTo(userPosition) }
-                isUserInteracting = false
-                onValueChangeFinished()
+                scope.launch { 
+                  delay(50)
+                  animatedPosition.snapTo(userPosition)
+                  isUserInteracting = false
+                  onValueChangeFinished()
+                }
               },
             ) { change, _ ->
               change.consume()
@@ -797,93 +808,4 @@ private fun PreviewSeekBar() {
     chapters = persistentListOf(),
     paused = false,
   )
-}
-
-@Composable
-fun SeekbarPreview(
-  style: SeekbarStyle,
-  modifier: Modifier = Modifier,
-  onClick: (() -> Unit)? = null,
-) {
-  val infiniteTransition = rememberInfiniteTransition(label = "seekbar_preview")
-  val progress by infiniteTransition.animateFloat(
-    initialValue = 0f,
-    targetValue = 1f,
-    animationSpec = infiniteRepeatable(
-      animation = tween(3000, easing = LinearEasing),
-      repeatMode = RepeatMode.Reverse
-    ),
-    label = "progress"
-  )
-  val duration = 100f
-  val position = progress * duration
-
-  // Dummy chapters for preview to visualize chapter separation
-  val dummyChapters = persistentListOf(
-    Segment(name = "Chapter 1", start = 0f),
-    Segment(name = "Chapter 2", start = duration * 0.35f),
-    Segment(name = "Chapter 3", start = duration * 0.65f),
-  )
-  
-  Box(
-    modifier = modifier
-      .height(32.dp),
-    contentAlignment = Alignment.Center
-  ) {
-    // Seekbar content
-    when (style) {
-      SeekbarStyle.Standard -> {
-        StandardSeekbar(
-          position = position,
-          duration = duration,
-          chapters = dummyChapters,
-          isPaused = false,
-          isScrubbing = false,
-          useWavySeekbar = true,
-          seekbarStyle = SeekbarStyle.Standard,
-          onSeek = {},
-          onSeekFinished = {},
-        )
-      }
-      SeekbarStyle.Wavy -> {
-        SquigglySeekbar(
-          position = position,
-          duration = duration,
-          chapters = dummyChapters,
-          isPaused = false,
-          isScrubbing = false,
-          useWavySeekbar = true,
-          seekbarStyle = SeekbarStyle.Wavy,
-          onSeek = {},
-          onSeekFinished = {},
-        )
-      }
-      SeekbarStyle.Thick -> {
-        StandardSeekbar(
-          position = position,
-          duration = duration,
-          chapters = dummyChapters,
-          isPaused = false,
-          isScrubbing = false,
-          useWavySeekbar = true,
-          seekbarStyle = SeekbarStyle.Thick,
-          onSeek = {},
-          onSeekFinished = {},
-        )
-      }
-    }
-    
-    // Invisible overlay that intercepts all touch events and triggers onClick
-    if (onClick != null) {
-      Box(
-        modifier = Modifier
-          .matchParentSize()
-          .clickable(
-            interactionSource = remember { MutableInteractionSource() },
-            indication = null, // No ripple on overlay itself
-            onClick = onClick
-          )
-      )
-    }
-  }
 }
